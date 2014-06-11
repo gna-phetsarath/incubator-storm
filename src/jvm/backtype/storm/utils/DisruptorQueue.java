@@ -1,16 +1,22 @@
 package backtype.storm.utils;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
 import com.lmax.disruptor.AlertException;
 import com.lmax.disruptor.ClaimStrategy;
 import com.lmax.disruptor.EventFactory;
 import com.lmax.disruptor.EventHandler;
+import com.lmax.disruptor.InsufficientCapacityException;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.Sequence;
 import com.lmax.disruptor.SequenceBarrier;
 import com.lmax.disruptor.SingleThreadedClaimStrategy;
 import com.lmax.disruptor.WaitStrategy;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.TimeUnit;
 
 /**
  *
@@ -27,7 +33,11 @@ public class DisruptorQueue {
     
     // TODO: consider having a threadlocal cache of this variable to speed up reads?
     volatile boolean consumerStartedFlag = false;
-    ConcurrentLinkedQueue<Object> _cache = new ConcurrentLinkedQueue();
+    ConcurrentLinkedQueue<Object> _cache = new ConcurrentLinkedQueue<Object>();
+    
+    private final ReentrantReadWriteLock cacheLock = new ReentrantReadWriteLock();
+    private final Lock readLock  = cacheLock.readLock();
+    private final Lock writeLock = cacheLock.writeLock();
     
     public DisruptorQueue(ClaimStrategy claim, WaitStrategy wait) {
         _buffer = new RingBuffer<MutableObject>(new ObjectEventFactory(), claim, wait);
@@ -36,6 +46,13 @@ public class DisruptorQueue {
         _buffer.setGatingSequences(_consumer);
         if(claim instanceof SingleThreadedClaimStrategy) {
             consumerStartedFlag = true;
+        } else {
+            // make sure we flush the pending messages in cache first
+            try {
+                publishDirect(FLUSH_CACHE, true);
+            } catch (InsufficientCapacityException e) {
+                throw new RuntimeException("This code should be unreachable!");
+            }
         }
     }
     
@@ -61,7 +78,6 @@ public class DisruptorQueue {
         }
     }
     
-    
     private void consumeBatchToCursor(long cursor, EventHandler<Object> handler) {
         for(long curr = _consumer.get() + 1; curr <= cursor; curr++) {
             try {
@@ -70,7 +86,7 @@ public class DisruptorQueue {
                 mo.setObject(null);
                 if(o==FLUSH_CACHE) {
                     Object c = null;
-                    while(true) {                        
+                    while(true) {
                         c = _cache.poll();
                         if(c==null) break;
                         else handler.onEvent(c, curr, true);
@@ -92,30 +108,75 @@ public class DisruptorQueue {
      * Caches until consumerStarted is called, upon which the cache is flushed to the consumer
      */
     public void publish(Object obj) {
-        if(consumerStartedFlag) {
-            final long id = _buffer.next();
-            final MutableObject m = _buffer.get(id);
-            m.setObject(obj);
-            _buffer.publish(id);
-        } else {
-            _cache.add(obj);
-            if(consumerStartedFlag) flushCache();
+        try {
+            publish(obj, true);
+        } catch (InsufficientCapacityException ex) {
+            throw new RuntimeException("This code should be unreachable!");
         }
     }
     
-    public void consumerStarted() {
-        if(!consumerStartedFlag) {
-            consumerStartedFlag = true;
-            flushCache();
+    /*
+     * Caches until consumerStarted is called, upon which the cache is flushed to the consumer
+     */
+    public void publish(Object obj, boolean block) throws InsufficientCapacityException {
+        boolean publishNow = consumerStartedFlag;
+
+        if (!publishNow) {
+            readLock.lock(); 
+            try {
+                publishNow = consumerStartedFlag;
+                if (!publishNow) {
+                    _cache.add(obj);
+                }
+            } finally {
+                readLock.unlock();
+            }
         }
-    }
-    
-    private void flushCache() {
-        publish(FLUSH_CACHE);
+        if (publishNow) {
+            publishDirect(obj, block);
+        }
     }
 
+    private void publishDirect(Object obj, boolean block) throws InsufficientCapacityException {
+        final long id;
+        if(block) {
+             id = _buffer.next();
+         } else {
+             id = _buffer.tryNext(1);
+          }
+         final MutableObject m = _buffer.get(id);
+         m.setObject(obj);
+         _buffer.publish(id);
+      }
+    
+    public void consumerStarted() {
+        consumerStartedFlag = true;
+        // Use writeLock to make sure all pending cache add opearation completed
+        writeLock.lock();
+        writeLock.unlock();
+    }
+    
+    public long  population() { return (writePos() - readPos()); }
+    public long  capacity()   { return _buffer.getBufferSize(); }
+    public long  writePos()   { return _buffer.getCursor(); }
+    public long  readPos()    { return _consumer.get(); }
+    public float pctFull()    { return (1.0F * population() / capacity()); }
+
+    //@Override
+    public Object getState() {
+        Map state = new HashMap<String, Object>();
+        // get readPos then writePos so it's never an under-estimate
+        long rp = readPos();
+        long wp = writePos();
+        state.put("capacity",   capacity());
+        state.put("population", wp - rp);
+        state.put("write_pos",  wp);
+        state.put("read_pos",   rp);
+        return state;
+    }
+    
     public static class ObjectEventFactory implements EventFactory<MutableObject> {
-        @Override
+        //@Override
         public MutableObject newInstance() {
             return new MutableObject();
         }        

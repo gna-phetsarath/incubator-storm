@@ -22,3 +22,6 @@ _release
 .lein-deps-sum
 *.iml
 
+/.project
+/.classpath
+/.settings
